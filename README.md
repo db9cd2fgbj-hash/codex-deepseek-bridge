@@ -4,12 +4,13 @@
 
 它提供：
 
-- 可视化登录和状态页面
+- 可视化登录、状态页和快捷测试
 - DeepSeek Web 凭证捕获与本地保存
 - `/v1/models`
 - `/v1/chat/completions`
 - `/v1/responses`
 - 基础工具调用适配：`function_call`、`custom_tool_call`、`tool_search_call`
+- 内置 DeepSeekHashV1 PoW 源文件，无需额外配置 PoW 路径
 
 > 注意：这是 DeepSeek Web 的本地桥接方案，不是 DeepSeek 官方 API。工具调用依赖提示词输出 `<tool_call>` 后由网关转换成 Responses 事件，稳定性不等同于原生工具调用模型。
 
@@ -33,7 +34,6 @@
 - Chrome 或 Microsoft Edge
 - 一个可登录的 DeepSeek Web 账号
 - Codex Desktop / Codex CLI，并支持自定义 `model_provider`
-- PoW 依赖源文件，用于读取 DeepSeek PoW WASM
 
 安装 npm 依赖：
 
@@ -47,28 +47,15 @@ npm install
 playwright-core
 ```
 
-`node_modules/` 不会提交到仓库。克隆项目后必须自己执行 `npm install`。
+`node_modules/` 不会提交到仓库。克隆项目后需要自己执行 `npm install`。
 
-## PoW 依赖怎么用
-
-DeepSeek Web 的 PoW 计算需要读取一个 PoW 依赖源文件，并从中提取 `SHA3_WASM_B64`。
-
-你需要自己准备这个依赖源文件，然后设置环境变量 `DEEPSEEK_POW_SOURCE_PATH` 指向它：
+PoW 运行所需的 WASM 常量已经内置在：
 
 ```text
-<path-to-pow-source-file>
+src/deepseek-pow-wasm.mjs
 ```
 
-PowerShell 示例：
-
-```powershell
-$env:DEEPSEEK_POW_SOURCE_PATH="<path-to-pow-source-file>"
-npm start
-```
-
-如果不设置这个环境变量，遇到 DeepSeekHashV1 PoW 时网关会报错。
-
-PoW 依赖源文件不包含在本仓库里，请自行准备，并遵守对应项目的许可证。
+无需再准备额外的 PoW 文件或环境变量。
 
 ## 安全提醒
 
@@ -108,14 +95,6 @@ http://127.0.0.1:8787
 ```
 
 ## 启动本地网关
-
-先设置 PoW 依赖源文件路径：
-
-```powershell
-$env:DEEPSEEK_POW_SOURCE_PATH="<path-to-pow-source-file>"
-```
-
-再启动：
 
 ```powershell
 npm start
@@ -176,10 +155,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/v1/responses -ContentT
 
 - Chrome 或 Microsoft Edge
 - DeepSeek Web
-- PoW 依赖源文件中的 PoW WASM 常量
 - Codex 的 Responses 兼容配置
 
-第三方组件分别适用它们自己的许可证和服务条款。
+第三方组件和在线服务分别适用它们自己的许可证和服务条款。
 
 ## 许可证
 

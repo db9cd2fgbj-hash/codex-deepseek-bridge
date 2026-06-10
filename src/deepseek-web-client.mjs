@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { SHA3_WASM_B64 } from "./deepseek-pow-wasm.mjs";
 
 const DEEPSEEK_BASE_URL = "https://chat.deepseek.com";
 const DEFAULT_USER_AGENT =
@@ -21,18 +21,7 @@ async function loadDeepSeekHashWasm() {
   if (wasmInstancePromise) return wasmInstancePromise;
 
   wasmInstancePromise = (async () => {
-    const sourcePath = process.env.DEEPSEEK_POW_SOURCE_PATH;
-    if (!sourcePath) {
-      throw new Error(
-        "DeepSeekHashV1 PoW requires DEEPSEEK_POW_SOURCE_PATH. Set it to the PoW dependency source file.",
-      );
-    }
-    const source = await readFile(sourcePath, "utf8");
-    const match = source.match(/const SHA3_WASM_B64\s*=\s*"([^"]+)";/);
-    if (!match) {
-      throw new Error(`Could not find PoW WASM in dependency source file: ${sourcePath}`);
-    }
-    const wasmBuffer = Buffer.from(match[1], "base64");
+    const wasmBuffer = Buffer.from(SHA3_WASM_B64, "base64");
     const { instance } = await WebAssembly.instantiate(wasmBuffer, { wbg: {} });
     return instance;
   })();
