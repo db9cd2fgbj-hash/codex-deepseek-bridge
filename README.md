@@ -159,6 +159,10 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/v1/responses -ContentT
 
 第三方组件和在线服务分别适用它们自己的许可证和服务条款。
 
+## 友情链接
+
+- [LINUX DO 社区](https://linux.do)
+
 ## 许可证
 
 本项目使用自定义非商业许可证。允许个人学习、研究和非商业使用；禁止未经授权的商业用途；不提供任何担保，作者不承担使用风险。
