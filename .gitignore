@@ -1,0 +1,11 @@
+.deepseek-auth/
+.deepseek-browser-profile/
+node_modules/
+_refs/
+.env
+.env.*
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+ui-preview-*.png

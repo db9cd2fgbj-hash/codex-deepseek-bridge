@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DeepSeek 桥接器</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <p class="eyebrow">Codex DeepSeek Bridge</p>
+          <h1>DeepSeek 网页桥接器</h1>
+        </div>
+        <div id="statusBadge" class="badge">检查中</div>
+      </section>
+
+      <section class="workspace">
+        <aside class="panel sidebar">
+          <div class="metric-row">
+            <div>
+              <span class="label">凭证状态</span>
+              <strong id="credentialState">未知</strong>
+            </div>
+            <div>
+              <span class="label">捕获时间</span>
+              <strong id="capturedAt">-</strong>
+            </div>
+          </div>
+
+          <div class="gateway-status">
+            <div>
+              <span>服务端口</span>
+              <strong id="gatewayPort">-</strong>
+            </div>
+            <div>
+              <span>模型接口</span>
+              <strong id="modelsState">-</strong>
+            </div>
+            <div>
+              <span>Responses</span>
+              <strong id="responsesHealth">-</strong>
+            </div>
+            <div>
+              <span>DeepSeek</span>
+              <strong id="authHealth">-</strong>
+            </div>
+          </div>
+
+          <div class="meta-list">
+            <div>
+              <span>令牌</span>
+              <div class="inline-value">
+                <code id="tokenPreview">已隐藏</code>
+                <button id="tokenToggle" class="small-button" type="button">显示</button>
+              </div>
+            </div>
+            <div>
+              <span>Cookie</span>
+              <code id="cookieBytes">-</code>
+            </div>
+            <div>
+              <span>凭证文件</span>
+              <code id="authPath">-</code>
+            </div>
+            <div>
+              <span>Base URL</span>
+              <code id="baseUrl">-</code>
+            </div>
+          </div>
+
+          <div class="config-box">
+            <div class="config-head">
+              <span class="label">Codex 配置</span>
+              <span id="responsesState" class="mini-badge">Responses</span>
+            </div>
+            <div class="config-list">
+              <div>
+                <span>base_url</span>
+                <code id="codexBaseUrl">-</code>
+                <button class="copy-button" type="button" data-copy-target="codexBaseUrl">复制</button>
+              </div>
+              <div>
+                <span>api_key</span>
+                <code id="codexApiKey">-</code>
+                <button class="copy-button" type="button" data-copy-target="codexApiKey">复制</button>
+              </div>
+              <div>
+                <span>model</span>
+                <code id="codexModel">deepseek-web/deepseek-chat</code>
+                <button class="copy-button" type="button" data-copy-target="codexModel">复制</button>
+              </div>
+            </div>
+            <div class="toml-block">
+              <pre id="codexToml">-</pre>
+              <button id="copyToml" class="copy-button wide" type="button">复制完整配置</button>
+            </div>
+          </div>
+
+          <div class="tool-status">
+            <div class="tool-status-head">
+              <span class="label">工具调用</span>
+              <span id="toolCallingState" class="mini-badge">检查中</span>
+            </div>
+            <div class="tool-chips">
+              <span id="toolFunctionState">Function：-</span>
+              <span id="toolCustomState">Custom：-</span>
+              <span id="toolSearchState">Tool Search：-</span>
+            </div>
+            <div class="tool-grid">
+              <div>
+                <span>适配方式</span>
+                <strong id="toolStrategy">-</strong>
+              </div>
+              <div>
+                <span>事件输出</span>
+                <code id="toolEvents">-</code>
+              </div>
+            </div>
+          </div>
+
+          <button id="loginButton" class="primary-button" type="button">
+            <span class="button-icon" aria-hidden="true">›</span>
+            <span>开始登录</span>
+          </button>
+        </aside>
+
+        <div class="main-column">
+          <section class="panel chat-panel">
+            <div class="section-head">
+              <div>
+                <span class="label">可视化测试</span>
+                <h2>本地对话</h2>
+              </div>
+              <select id="modelSelect" class="select" aria-label="模型">
+                <option value="deepseek-web/deepseek-chat">DeepSeek V3</option>
+                <option value="deepseek-web/deepseek-reasoner">DeepSeek R1</option>
+              </select>
+            </div>
+
+            <div class="quick-tests" aria-label="快捷测试">
+              <button type="button" data-quick-test="chat">普通对话</button>
+              <button type="button" data-quick-test="responses">Responses</button>
+              <button type="button" data-quick-test="function">Function 工具</button>
+              <button type="button" data-quick-test="custom">Custom 工具</button>
+            </div>
+
+            <div id="chatOutput" class="chat-output" aria-live="polite">
+              <div class="empty-state">等待测试输出</div>
+            </div>
+
+            <form id="chatForm" class="composer">
+              <textarea
+                id="chatInput"
+                rows="3"
+                placeholder="输入一句测试消息，例如：用一句话介绍你自己"
+              ></textarea>
+              <button id="sendButton" class="send-button" type="submit">发送</button>
+            </form>
+          </section>
+
+          <section class="panel log-panel">
+            <div class="section-head compact">
+              <div>
+                <span class="label">实时日志</span>
+                <h2>运行状态</h2>
+              </div>
+              <div class="log-actions">
+                <div class="filter-tabs" aria-label="日志筛选">
+                  <button class="active" type="button" data-log-filter="all">全部</button>
+                  <button type="button" data-log-filter="tool">工具</button>
+                  <button type="button" data-log-filter="error">错误</button>
+                  <button type="button" data-log-filter="deepseek">请求</button>
+                </div>
+                <button id="refreshButton" class="icon-button" type="button" title="刷新状态">↻</button>
+              </div>
+            </div>
+            <div id="logs" class="logs" aria-live="polite"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>
