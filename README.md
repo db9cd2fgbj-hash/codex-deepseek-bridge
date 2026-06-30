@@ -9,10 +9,10 @@
 - `/v1/models`
 - `/v1/chat/completions`
 - `/v1/responses`
-- 基础工具调用适配：`function_call`、`custom_tool_call`、`tool_search_call`
+- 基础工具调用适配：Responses 事件和 OpenAI Chat `tool_calls`
 - 内置 DeepSeekHashV1 PoW 源文件，无需额外配置 PoW 路径
 
-> 注意：这是 DeepSeek Web 的本地桥接方案，不是 DeepSeek 官方 API。工具调用依赖提示词输出 `<tool_call>` 后由网关转换成 Responses 事件，稳定性不等同于原生工具调用模型。
+> 注意：这是 DeepSeek Web 的本地桥接方案，不是 DeepSeek 官方 API。工具调用依赖提示词输出 `<tool_call>` 或可解析的工具调用意图后由网关转换成 Responses 事件 / Chat `tool_calls`，稳定性不等同于原生工具调用模型。
 
 ## 使用限制
 
@@ -142,6 +142,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/v1/responses -ContentT
 
 - 普通对话
 - Responses
+- Chat Completions `tool_calls`
 - Function 工具
 - Custom 工具
 
@@ -156,6 +157,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8787/v1/responses -ContentT
 - Chrome 或 Microsoft Edge
 - DeepSeek Web
 - Codex 的 Responses 兼容配置
+- OpenAI Chat Completions 兼容工具调用
 
 第三方组件和在线服务分别适用它们自己的许可证和服务条款。
 

@@ -202,6 +202,17 @@ function messagesToPrompt(messages = []) {
   return messages
     .map((message) => {
       const role = message.role || "user";
+      if (role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+        const calls = message.tool_calls
+          .map((toolCall) => {
+            const name = toolCall?.function?.name || toolCall?.name || "tool";
+            const args = toolCall?.function?.arguments || toolCall?.arguments || "";
+            return `${name}${args ? `(${args})` : ""}`;
+          })
+          .join(", ");
+        return calls ? `assistant requested tools: ${calls}` : "";
+      }
+
       let content = "";
       if (typeof message.content === "string") {
         content = message.content;
@@ -215,6 +226,10 @@ function messagesToPrompt(messages = []) {
           })
           .filter(Boolean)
           .join("\n");
+      }
+      if (role === "tool") {
+        const name = message.name || message.tool_call_id || "tool";
+        return content.trim() ? `tool result from ${name}: ${content.trim()}` : "";
       }
       return content.trim() ? `${role}: ${content.trim()}` : "";
     })
@@ -301,6 +316,25 @@ function extractResponseTools(body = {}) {
   }
 
   return tools;
+}
+
+function extractChatTools(body = {}) {
+  if (!Array.isArray(body.tools)) return [];
+
+  return body.tools
+    .map((tool) => {
+      if (!tool || typeof tool !== "object") return null;
+      const name = responseToolName(tool);
+      if (!name) return null;
+      return {
+        kind: "function",
+        name,
+        wireName: name,
+        description: responseToolDescription(tool),
+        parameters: responseToolParameters(tool),
+      };
+    })
+    .filter(Boolean);
 }
 
 function stringifyForPrompt(value, maxChars = 1800) {
@@ -405,6 +439,19 @@ function responsesToPrompt(body, tools = extractResponseTools(body)) {
     if (text) parts.push(text);
   }
 
+  return parts.join("\n\n");
+}
+
+function chatCompletionsToPrompt(body, tools = extractChatTools(body)) {
+  const parts = [];
+  const toolPrompt = buildToolPrompt(tools);
+  if (toolPrompt) {
+    parts.push(toolPrompt);
+  }
+  const messagePrompt = messagesToPrompt(body.messages);
+  if (messagePrompt) {
+    parts.push(messagePrompt);
+  }
   return parts.join("\n\n");
 }
 
@@ -543,6 +590,45 @@ function parseJsonMaybe(raw) {
   }
 }
 
+function extractFirstJsonObject(text) {
+  const raw = String(text || "");
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let quote = "";
+  let escaped = false;
+
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === quote) {
+        inString = false;
+        quote = "";
+      }
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth++;
+    if (ch === "}") {
+      depth--;
+      if (depth === 0) return raw.slice(start, i + 1);
+    }
+  }
+
+  return raw.slice(start);
+}
+
 function normalizeFunctionArguments(raw) {
   const cleaned = stripCodeFence(raw);
   if (!cleaned) return "{}";
@@ -616,7 +702,38 @@ function parseToolCallFromText(text, tools) {
   }
 
   const parsed = parseJsonMaybe(raw);
-  return parseToolJsonObject(parsed, tools);
+  const directCall = parseToolJsonObject(parsed, tools);
+  if (directCall) return directCall;
+
+  const mentionedTool = tools.find((tool) => {
+    const name = String(tool.wireName || tool.name || "").trim();
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return (
+      name &&
+      new RegExp(
+        `(?:\\u8c03\\u7528|\\u4f7f\\u7528|call|use)\\s*(?:\\u5de5\\u5177\\s*)?${escapedName}`,
+        "i",
+      ).test(raw)
+    );
+  });
+  if (mentionedTool) {
+    const jsonText = extractFirstJsonObject(raw);
+    const jsonObj = parseJsonMaybe(jsonText);
+    const args =
+      jsonObj && typeof jsonObj === "object" && !jsonObj.tool && !jsonObj.name && !jsonObj.function
+        ? jsonObj
+        : jsonObj?.arguments || jsonObj?.parameters || {};
+    return {
+      spec: mentionedTool,
+      id: jsonObj?.id || jsonObj?.call_id || "",
+      arguments:
+        mentionedTool.kind === "custom"
+          ? normalizeCustomInput(typeof args === "string" ? args : JSON.stringify(args ?? ""))
+          : normalizeFunctionArguments(typeof args === "string" ? args : JSON.stringify(args ?? {})),
+    };
+  }
+
+  return null;
 }
 
 function makeFunctionCallItem(itemId, status, callId, spec, argumentsText = "") {
@@ -664,6 +781,46 @@ function makeToolCallItem(itemId, status, callId, toolCall, payload = "") {
     return makeToolSearchCallItem(itemId, status, callId, payload);
   }
   return makeFunctionCallItem(itemId, status, callId, toolCall.spec, payload);
+}
+
+function makeChatToolCall(toolCall) {
+  const callId = toolCall.id || `call_ds_${Date.now()}`;
+  const payload = toolCall.arguments || "{}";
+  const item = {
+    id: callId,
+    type: "function",
+    function: {
+      name: toolCall.spec.name,
+      arguments: payload,
+    },
+  };
+  rememberToolCall({
+    call_id: callId,
+    name: toolCall.spec.name,
+    type: "function_call",
+  });
+  return item;
+}
+
+function makeChatToolCallDelta(toolCall) {
+  const callId = toolCall.id || `call_ds_${Date.now()}`;
+  const payload = toolCall.arguments || "{}";
+  rememberToolCall({
+    call_id: callId,
+    name: toolCall.spec.name,
+    type: "function_call",
+  });
+  return [
+    {
+      index: 0,
+      id: callId,
+      type: "function",
+      function: {
+        name: toolCall.spec.name,
+        arguments: payload,
+      },
+    },
+  ];
 }
 
 function writeResponseToolCall(res, responseId, toolCall) {
@@ -794,7 +951,7 @@ async function runDeepSeekCompletion(body, options = {}) {
   const sessionKey = sessionKeyFromBody(body);
   const session = await getDeepSeekSession(client, sessionKey);
   const model = body.model || CHAT_MODEL;
-  const prompt = body.prompt || messagesToPrompt(body.messages);
+  const prompt = body.prompt || chatCompletionsToPrompt(body);
 
   if (!prompt.trim()) {
     throw new Error("没有可发送给 DeepSeek 的消息。");
@@ -833,6 +990,7 @@ async function runDeepSeekCompletion(body, options = {}) {
 }
 
 async function streamChatCompletions(res, body, options = {}) {
+  const tools = extractChatTools(body);
   res.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-store",
@@ -842,6 +1000,9 @@ async function streamChatCompletions(res, body, options = {}) {
   const result = await runDeepSeekCompletion(body, {
     signal: options.signal,
     onEvent: ({ event, requestId, created, model, delta }) => {
+      if (tools.length) {
+        return;
+      }
       sseWrite(res, {
         id: requestId,
         object: "chat.completion.chunk",
@@ -861,6 +1022,54 @@ async function streamChatCompletions(res, body, options = {}) {
     },
   });
 
+  if (tools.length) {
+    const toolCall = parseToolCallFromText(result.content, tools);
+    if (toolCall) {
+      sseWrite(res, {
+        id: result.requestId,
+        object: "chat.completion.chunk",
+        created: result.created,
+        model: result.model,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              role: "assistant",
+              tool_calls: makeChatToolCallDelta(toolCall),
+            },
+            finish_reason: null,
+          },
+        ],
+      });
+      sseWrite(res, {
+        id: result.requestId,
+        object: "chat.completion.chunk",
+        created: result.created,
+        model: result.model,
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      });
+      pushLog(`DeepSeek Web requested chat tool: ${toolCall.spec.name}`);
+      sseDone(res);
+      res.end();
+      return;
+    }
+    if (result.content) {
+      sseWrite(res, {
+        id: result.requestId,
+        object: "chat.completion.chunk",
+        created: result.created,
+        model: result.model,
+        choices: [
+          {
+            index: 0,
+            delta: { content: result.content },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+  }
+
   sseWrite(res, {
     id: result.requestId,
     object: "chat.completion.chunk",
@@ -873,7 +1082,36 @@ async function streamChatCompletions(res, body, options = {}) {
 }
 
 async function jsonChatCompletions(res, body) {
+  const tools = extractChatTools(body);
   const result = await runDeepSeekCompletion({ ...body, stream: false });
+  const toolCall = tools.length ? parseToolCallFromText(result.content, tools) : null;
+  if (toolCall) {
+    sendJson(res, 200, {
+      id: result.requestId,
+      object: "chat.completion",
+      created: result.created,
+      model: result.model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [makeChatToolCall(toolCall)],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+      },
+    });
+    pushLog(`DeepSeek Web requested chat tool: ${toolCall.spec.name}`);
+    return;
+  }
+
   sendJson(res, 200, {
     id: result.requestId,
     object: "chat.completion",
