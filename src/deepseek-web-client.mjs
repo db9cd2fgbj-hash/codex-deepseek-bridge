@@ -40,16 +40,13 @@ export class DeepSeekWebClient {
     return {
       Cookie: this.cookie,
       "User-Agent": this.userAgent,
-      "Content-Type": "application/json",
       Accept: "*/*",
       ...(this.bearer ? { Authorization: `Bearer ${this.bearer}` } : {}),
       Referer: `${DEEPSEEK_BASE_URL}/`,
-      Origin: DEEPSEEK_BASE_URL,
       "x-client-platform": "web",
-      "x-client-version": "1.7.0",
-      "x-app-version": "20241129.1",
-      "x-client-locale": "zh_CN",
-      "x-client-timezone-offset": "28800",
+      "x-client-version": "2.7.0",
+      "x-client-locale": "en_US",
+      "x-client-timezone-offset": "25200",
     };
   }
 
@@ -62,7 +59,7 @@ export class DeepSeekWebClient {
   async createPowChallenge(targetPath) {
     const res = await fetch(`${DEEPSEEK_BASE_URL}/api/v0/chat/create_pow_challenge`, {
       method: "POST",
-      headers: await this.fetchHeaders(),
+      headers: { ...(await this.fetchHeaders()), "Content-Type": "application/json" },
       body: JSON.stringify({ target_path: targetPath }),
     });
 
@@ -143,7 +140,7 @@ export class DeepSeekWebClient {
     const targetPath = "/api/v0/chat_session/create";
     const res = await fetch(`${DEEPSEEK_BASE_URL}${targetPath}`, {
       method: "POST",
-      headers: await this.fetchHeaders(),
+      headers: { ...(await this.fetchHeaders()), "Content-Type": "application/json" },
       body: JSON.stringify({}),
     });
 
@@ -152,7 +149,7 @@ export class DeepSeekWebClient {
     }
 
     const data = await res.json();
-    const session = data.data?.biz_data || {};
+    const session = data.data?.biz_data?.chat_session || data.data?.biz_data || {};
     const sessionId = session.id || session.chat_session_id || "";
     if (!sessionId) {
       throw new Error("DeepSeek 会话返回里没有 session id");
@@ -169,8 +166,11 @@ export class DeepSeekWebClient {
     const answer = await this.solvePow(challenge);
     const powResponse = Buffer.from(
       JSON.stringify({
-        ...challenge,
+        algorithm: challenge.algorithm,
+        challenge: challenge.challenge,
+        salt: challenge.salt,
         answer,
+        ...(challenge.signature ? { signature: challenge.signature } : {}),
         target_path: targetPath,
       }),
     ).toString("base64");
@@ -180,15 +180,18 @@ export class DeepSeekWebClient {
       method: "POST",
       headers: {
         ...(await this.fetchHeaders()),
+        "Content-Type": "application/json",
         "x-ds-pow-response": powResponse,
       },
       body: JSON.stringify({
         chat_session_id: params.sessionId,
         parent_message_id: params.parentMessageId ?? null,
+        model_type: null,
         prompt: params.message,
         ref_file_ids: params.fileIds || [],
         thinking_enabled: model !== "deepseek-chat",
         search_enabled: params.searchEnabled ?? false,
+        action: null,
         preempt: params.preempt ?? false,
       }),
       signal: params.signal,
@@ -204,11 +207,21 @@ export class DeepSeekWebClient {
   }
 }
 
-export function deepSeekEventsFromSseData(data) {
+function isReasoningFragmentType(type) {
+  const normalized = String(type || "").toUpperCase();
+  return normalized === "THINK" || normalized === "THINKING" || normalized === "REASONING";
+}
+
+export function deepSeekEventsFromSseData(data, state = {}) {
   const events = [];
 
-  if (hasMeaningfulText(data.response_message_id)) {
+  if (data.response_message_id !== undefined && data.response_message_id !== null) {
     events.push({ type: "meta", parentMessageId: data.response_message_id });
+  }
+
+  const path = hasMeaningfulText(data.p) ? data.p : state.lastPath || "";
+  if (hasMeaningfulText(data.p)) {
+    state.lastPath = data.p;
   }
 
   const pushText = (delta) => {
@@ -217,44 +230,66 @@ export function deepSeekEventsFromSseData(data) {
   const pushReasoning = (delta) => {
     if (hasMeaningfulText(delta)) events.push({ type: "reasoning", delta });
   };
+  const pushFragmentText = (value) => {
+    if (!hasMeaningfulText(value)) return;
+    if (state.thought) pushReasoning(value);
+    else pushText(value);
+  };
 
-  if ((data.p?.includes("reasoning") || data.type === "thinking") && hasMeaningfulText(data.v)) {
-    pushReasoning(data.v);
+  const fragments = Array.isArray(data.v)
+    ? data.v
+    : Array.isArray(data.v?.response?.fragments)
+      ? data.v.response.fragments
+      : null;
+
+  if (fragments) {
+    for (const fragment of fragments) {
+      if (!fragment || typeof fragment !== "object") continue;
+      if (isReasoningFragmentType(fragment.type)) {
+        state.thought = true;
+        pushReasoning(fragment.content || "");
+        continue;
+      }
+      if (typeof fragment.content === "string" && fragment.content) {
+        state.thought = false;
+        pushText(fragment.content);
+        continue;
+      }
+      if (typeof fragment.v === "string" && fragment.v && hasMeaningfulText(fragment.p)) {
+        if (isReasoningFragmentType(fragment.type) || /reasoning|thinking/i.test(fragment.p)) {
+          state.thought = true;
+          pushReasoning(fragment.v);
+        } else if (/content|choices/i.test(fragment.p)) {
+          pushFragmentText(fragment.v);
+        }
+      }
+    }
     return events;
   }
-  if (data.type === "thinking" && hasMeaningfulText(data.content)) {
+
+  if (typeof data.v === "string" && data.v) {
+    if (data.type === "thinking" || data.type === "reasoning") {
+      state.thought = true;
+      pushReasoning(data.v);
+    } else if (/reasoning|thinking/i.test(path)) {
+      state.thought = true;
+      pushReasoning(data.v);
+    } else if (/content|choices/i.test(path)) {
+      pushFragmentText(data.v);
+    } else if (!path) {
+      pushText(data.v);
+    }
+    return events;
+  }
+
+  if ((data.type === "thinking" || data.type === "reasoning") && hasMeaningfulText(data.content)) {
+    state.thought = true;
     pushReasoning(data.content);
     return events;
   }
-  if (hasMeaningfulText(data.v) && (!data.p || data.p.includes("content") || data.p.includes("choices"))) {
-    pushText(data.v);
-    return events;
-  }
   if (data.type === "text" && hasMeaningfulText(data.content)) {
+    state.thought = false;
     pushText(data.content);
-    return events;
-  }
-
-  if (Array.isArray(data.v)) {
-    for (const fragment of data.v) {
-      if (fragment?.type === "THINKING" || fragment?.type === "reasoning") {
-        pushReasoning(fragment.content || "");
-      } else {
-        pushText(fragment?.content || "");
-      }
-    }
-    return events;
-  }
-
-  const fragments = data.v?.response?.fragments;
-  if (Array.isArray(fragments)) {
-    for (const fragment of fragments) {
-      if (fragment?.type === "THINKING" || fragment?.type === "reasoning") {
-        pushReasoning(fragment.content || "");
-      } else {
-        pushText(fragment?.content || "");
-      }
-    }
     return events;
   }
 
@@ -268,6 +303,7 @@ export function deepSeekEventsFromSseData(data) {
 export async function* parseDeepSeekStream(stream) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
+  const state = {};
   let buffer = "";
 
   while (true) {
@@ -287,7 +323,7 @@ export async function* parseDeepSeekStream(stream) {
 
       try {
         const data = JSON.parse(payload);
-        for (const event of deepSeekEventsFromSseData(data)) {
+        for (const event of deepSeekEventsFromSseData(data, state)) {
           yield event;
         }
       } catch {
@@ -302,7 +338,7 @@ export async function* parseDeepSeekStream(stream) {
     if (payload && payload !== "[DONE]") {
       try {
         const data = JSON.parse(payload);
-        for (const event of deepSeekEventsFromSseData(data)) {
+        for (const event of deepSeekEventsFromSseData(data, state)) {
           yield event;
         }
       } catch {

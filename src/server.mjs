@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
 import {
   AUTH_PATH,
   DEFAULT_PORT as DEFAULT_CDP_PORT,
@@ -10,7 +11,12 @@ import {
   runDeepSeekLogin,
   summarizeCredentials,
 } from "./deepseek-auth.mjs";
-import { DeepSeekWebClient, parseDeepSeekStream } from "./deepseek-web-client.mjs";
+import { DeepSeekWebClient } from "./deepseek-web-client.mjs";
+import { createAuthManager } from "./orchestration/auth-manager.mjs";
+import { createPipeline } from "./orchestration/pipeline.mjs";
+import { runToolLoop } from "./orchestration/tool-loop.mjs";
+import { createSessionStore } from "./orchestration/session-store.mjs";
+import { sseWrite, sseEvent, sseDone } from "./transport/sse-writer.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
@@ -25,10 +31,26 @@ const state = {
   lastError: "",
   logs: [],
   clients: new Set(),
-  chatSessions: new Map(),
-  responseSessions: new Map(),
   toolCalls: new Map(),
 };
+
+const chatSessions = createSessionStore();
+const responseSessions = createSessionStore();
+const authManager = createAuthManager({
+  loadCredentials: readCredentials,
+  createClient: async (credentials) => {
+    const client = new DeepSeekWebClient(credentials);
+    await client.init();
+    return client;
+  },
+});
+
+const pipeline = createPipeline({
+  authManager,
+  sessionStore: chatSessions,
+  log: pushLog,
+  defaultModel: CHAT_MODEL,
+});
 
 function nowStamp() {
   return new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -140,6 +162,7 @@ async function startLogin(res) {
     onProgress: (message) => pushLog(message),
   })
     .then(() => {
+      authManager.invalidate();
       pushLog("凭证已保存，可以测试对话。");
     })
     .catch((error) => {
@@ -167,13 +190,7 @@ async function handleSse(req, res) {
 }
 
 async function makeDeepSeekClient() {
-  const credentials = await readCredentials();
-  if (!credentials?.cookie || !credentials?.bearer) {
-    throw new Error("还没有 DeepSeek 登录凭证，请先登录。");
-  }
-  const client = new DeepSeekWebClient(credentials);
-  await client.init();
-  return client;
+  return authManager.getClient();
 }
 
 function modelPayload() {
@@ -457,48 +474,18 @@ function chatCompletionsToPrompt(body, tools = extractChatTools(body)) {
 
 function responsesSessionKeyFromBody(body) {
   const previous = body.previous_response_id;
-  if (previous && state.responseSessions.has(previous)) {
-    return state.responseSessions.get(previous);
+  if (previous && responseSessions.get(previous)) {
+    return responseSessions.get(previous);
   }
   return body.metadata?.session_id || body.session_id || body.user || "responses-default";
 }
 
 function rememberResponseSession(responseId, sessionKey) {
-  state.responseSessions.set(responseId, sessionKey);
-  if (state.responseSessions.size > 500) {
-    const firstKey = state.responseSessions.keys().next().value;
-    if (firstKey) state.responseSessions.delete(firstKey);
-  }
+  responseSessions.set(responseId, sessionKey);
 }
 
 function sessionKeyFromBody(body) {
   return body.user || body.metadata?.session_id || body.session_id || "default";
-}
-
-async function getDeepSeekSession(client, sessionKey) {
-  const cached = state.chatSessions.get(sessionKey);
-  if (cached?.sessionId) return cached;
-
-  const session = await client.createChatSession();
-  const next = {
-    sessionId: session.chat_session_id,
-    parentMessageId: null,
-  };
-  state.chatSessions.set(sessionKey, next);
-  return next;
-}
-
-function sseWrite(res, payload) {
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function sseEvent(res, event, payload) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-
-function sseDone(res) {
-  res.write("data: [DONE]\n\n");
 }
 
 function makeResponseBase(responseId, model, status, output = []) {
@@ -675,9 +662,48 @@ function parseToolJsonObject(obj, tools) {
   };
 }
 
-function parseToolCallFromText(text, tools) {
+function parseDsmlToolCall(text, tools) {
+  const raw = String(text || "").replace(/\uFF5C+/g, "|");
+  if (!/DSML/i.test(raw) && !/<invoke\s+name=/i.test(raw)) return null;
+  const dsml = "\\|*DSML\\|*";
+  const prefix = `(?:${dsml}\\s*)?`;
+  const invoke = raw.match(
+    new RegExp(
+      `<${prefix}invoke\\s+name=["']([^"']+)["']\\s*>([\\s\\S]*?)(?:</\\s*${prefix}invoke>|$)`,
+      "i",
+    ),
+  );
+  if (!invoke) return null;
+  const name = invoke[1].trim();
+  if (!name) return null;
+  const spec = findToolSpec(name, tools);
+  const args = {};
+  const parameterRe = new RegExp(
+    `<${prefix}parameter\\s+name=["']([^"']+)["'](?:\\s+string=["'](true|false)["'])?\\s*>([\\s\\S]*?)</\\s*${prefix}parameter>`,
+    "gi",
+  );
+  for (const match of invoke[2].matchAll(parameterRe)) {
+    const value = match[3];
+    if (match[2] === "false") {
+      const parsed = parseJsonMaybe(value);
+      args[match[1]] = parsed === null ? value : parsed;
+    } else {
+      args[match[1]] = value;
+    }
+  }
+  if (spec.kind === "custom") {
+    const input = typeof args.input === "string" ? args.input : JSON.stringify(args);
+    return { spec, id: "", arguments: normalizeCustomInput(input) };
+  }
+  return { spec, id: "", arguments: JSON.stringify(args) };
+}
+
+export function parseToolCallFromText(text, tools) {
   const raw = String(text || "").trim();
   if (!raw) return null;
+
+  const dsml = parseDsmlToolCall(raw, tools);
+  if (dsml) return dsml;
 
   const xml = raw.match(/<tool_call\b([^>]*)>([\s\S]*?)(?:<\/tool_call>|$)/i);
   if (xml) {
@@ -946,49 +972,6 @@ function writeResponseCompleted(res, responseId, model, output) {
   });
 }
 
-async function runDeepSeekCompletion(body, options = {}) {
-  const client = await makeDeepSeekClient();
-  const sessionKey = sessionKeyFromBody(body);
-  const session = await getDeepSeekSession(client, sessionKey);
-  const model = body.model || CHAT_MODEL;
-  const prompt = body.prompt || chatCompletionsToPrompt(body);
-
-  if (!prompt.trim()) {
-    throw new Error("没有可发送给 DeepSeek 的消息。");
-  }
-
-  const requestId = `chatcmpl-ds-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-  pushLog(`发送到 DeepSeek Web：${prompt.slice(0, 60).replace(/\s+/g, " ")}`);
-
-  const deepSeekStream = await client.chatCompletions({
-    sessionId: session.sessionId,
-    parentMessageId: session.parentMessageId,
-    message: prompt,
-    model,
-    searchEnabled: Boolean(body.search_enabled),
-    signal: options.signal,
-  });
-
-  let fullText = "";
-  for await (const event of parseDeepSeekStream(deepSeekStream)) {
-    if (event.type === "meta" && event.parentMessageId) {
-      session.parentMessageId = event.parentMessageId;
-      state.chatSessions.set(sessionKey, session);
-      continue;
-    }
-
-    if (event.type !== "text" && event.type !== "reasoning") continue;
-    const delta = event.delta || "";
-    if (!delta) continue;
-    fullText += delta;
-    options.onEvent?.({ event, requestId, created, model, delta });
-  }
-
-  pushLog(`DeepSeek Web 回复完成：${fullText.length} 字符。`);
-  return { requestId, created, model, content: fullText };
-}
-
 async function streamChatCompletions(res, body, options = {}) {
   const tools = extractChatTools(body);
   res.writeHead(200, {
@@ -997,39 +980,34 @@ async function streamChatCompletions(res, body, options = {}) {
     connection: "keep-alive",
   });
 
-  const result = await runDeepSeekCompletion(body, {
-    signal: options.signal,
-    onEvent: ({ event, requestId, created, model, delta }) => {
-      if (tools.length) {
-        return;
-      }
+  const requestId = `chatcmpl-ds-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = body.model || CHAT_MODEL;
+  const normalized = {
+    sessionKey: sessionKeyFromBody(body),
+    model,
+    prompt: body.prompt || chatCompletionsToPrompt(body),
+    searchEnabled: Boolean(body.search_enabled),
+  };
+
+  let fullText = "";
+  if (tools.length) {
+    for await (const event of runToolLoop({
+      pipeline,
+      normalized,
+      tools,
+      ctx: { requestId, created, model },
+      signal: options.signal,
+      parseToolCall: parseToolCallFromText,
+    })) {
+      if (event.type === "text_delta" && event.delta) fullText += event.delta;
+      if (event.type !== "tool_call_done") continue;
+      const toolCall = { id: event.payload.id, spec: event.payload.spec, arguments: event.payload.arguments };
       sseWrite(res, {
         id: requestId,
         object: "chat.completion.chunk",
         created,
         model,
-      choices: [
-        {
-          index: 0,
-          delta:
-            event.type === "reasoning"
-              ? { reasoning_content: delta }
-              : { content: delta },
-          finish_reason: null,
-        },
-      ],
-    });
-    },
-  });
-
-  if (tools.length) {
-    const toolCall = parseToolCallFromText(result.content, tools);
-    if (toolCall) {
-      sseWrite(res, {
-        id: result.requestId,
-        object: "chat.completion.chunk",
-        created: result.created,
-        model: result.model,
         choices: [
           {
             index: 0,
@@ -1042,27 +1020,48 @@ async function streamChatCompletions(res, body, options = {}) {
         ],
       });
       sseWrite(res, {
-        id: result.requestId,
+        id: requestId,
         object: "chat.completion.chunk",
-        created: result.created,
-        model: result.model,
+        created,
+        model,
         choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
       });
-      pushLog(`DeepSeek Web requested chat tool: ${toolCall.spec.name}`);
+      pushLog(`DeepSeek Web requested chat tool: ${event.payload.name}`);
       sseDone(res);
       res.end();
       return;
     }
-    if (result.content) {
+    if (fullText) {
       sseWrite(res, {
-        id: result.requestId,
+        id: requestId,
         object: "chat.completion.chunk",
-        created: result.created,
-        model: result.model,
+        created,
+        model,
         choices: [
           {
             index: 0,
-            delta: { content: result.content },
+            delta: { content: fullText },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+  } else {
+    for await (const event of pipeline.runChatCompletion(normalized, { requestId, created, model }, options.signal)) {
+      const delta = event.delta ?? "";
+      if (!delta || (event.type !== "text_delta" && event.type !== "reasoning_delta")) continue;
+      sseWrite(res, {
+        id: requestId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [
+          {
+            index: 0,
+            delta:
+              event.type === "reasoning_delta"
+                ? { reasoning_content: delta }
+                : { content: delta },
             finish_reason: null,
           },
         ],
@@ -1071,10 +1070,10 @@ async function streamChatCompletions(res, body, options = {}) {
   }
 
   sseWrite(res, {
-    id: result.requestId,
+    id: requestId,
     object: "chat.completion.chunk",
-    created: result.created,
-    model: result.model,
+    created,
+    model,
     choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
   });
   sseDone(res);
@@ -1083,14 +1082,28 @@ async function streamChatCompletions(res, body, options = {}) {
 
 async function jsonChatCompletions(res, body) {
   const tools = extractChatTools(body);
-  const result = await runDeepSeekCompletion({ ...body, stream: false });
-  const toolCall = tools.length ? parseToolCallFromText(result.content, tools) : null;
+  const requestId = `chatcmpl-ds-${Date.now()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const model = body.model || CHAT_MODEL;
+  const normalized = {
+    sessionKey: sessionKeyFromBody(body),
+    model,
+    prompt: body.prompt || chatCompletionsToPrompt(body),
+    searchEnabled: Boolean(body.search_enabled),
+  };
+
+  let content = "";
+  for await (const event of pipeline.runChatCompletion(normalized, { requestId, created, model })) {
+    if (event.type === "text_delta" && event.delta) content += event.delta;
+  }
+
+  const toolCall = tools.length ? parseToolCallFromText(content, tools) : null;
   if (toolCall) {
     sendJson(res, 200, {
-      id: result.requestId,
+      id: requestId,
       object: "chat.completion",
-      created: result.created,
-      model: result.model,
+      created: created,
+      model: model,
       choices: [
         {
           index: 0,
@@ -1113,16 +1126,16 @@ async function jsonChatCompletions(res, body) {
   }
 
   sendJson(res, 200, {
-    id: result.requestId,
+    id: requestId,
     object: "chat.completion",
-    created: result.created,
-    model: result.model,
+    created: created,
+    model: model,
     choices: [
       {
         index: 0,
         message: {
           role: "assistant",
-          content: result.content,
+          content: content,
         },
         finish_reason: "stop",
       },
@@ -1153,37 +1166,45 @@ async function streamResponses(res, body, options = {}) {
   let textStarted = false;
   let fullText = "";
 
-  await runDeepSeekCompletion(
-    {
-      model,
-      prompt,
-      stream: true,
-      session_id: sessionKey,
-      search_enabled: body.search_enabled,
-    },
-    {
-      signal: options.signal,
-      onEvent: ({ event, delta }) => {
-        if (event.type !== "text" && event.type !== "reasoning") return;
-        if (tools.length) {
-          fullText += delta;
-          return;
-        }
-        if (!textStarted) {
-          writeResponseTextStart(res, responseId);
-          textStarted = true;
-        }
-        fullText += delta;
-        sseEvent(res, "response.output_text.delta", {
-          type: "response.output_text.delta",
-          item_id: `${responseId}_msg`,
-          output_index: 0,
-          content_index: 0,
-          delta,
-        });
-      },
-    },
-  );
+  const normalized = {
+    sessionKey,
+    model,
+    prompt,
+    searchEnabled: Boolean(body.search_enabled),
+  };
+  const upstream = tools.length
+    ? runToolLoop({
+        pipeline,
+        normalized,
+        tools,
+        ctx: { requestId: responseId, created: Math.floor(Date.now() / 1000), model },
+        signal: options.signal,
+        parseToolCall: parseToolCallFromText,
+      })
+    : pipeline.runChatCompletion(normalized, { requestId: responseId, created: Math.floor(Date.now() / 1000), model }, options.signal);
+
+  for await (const event of upstream) {
+    if (event.type !== "text_delta" && event.type !== "reasoning_delta") continue;
+    const delta = event.delta ?? "";
+    if (!delta) continue;
+    if (tools.length) {
+      if (event.type === "text_delta") fullText += delta;
+      continue;
+    }
+    if (event.type === "reasoning_delta") continue;
+    if (!textStarted) {
+      writeResponseTextStart(res, responseId);
+      textStarted = true;
+    }
+    fullText += delta;
+    sseEvent(res, "response.output_text.delta", {
+      type: "response.output_text.delta",
+      item_id: `${responseId}_msg`,
+      output_index: 0,
+      content_index: 0,
+      delta,
+    });
+  }
 
   const toolCall = tools.length ? parseToolCallFromText(fullText, tools) : null;
   let output = [];
@@ -1215,13 +1236,21 @@ async function jsonResponses(res, body) {
   const tools = extractResponseTools(body);
   const sessionKey = responsesSessionKeyFromBody(body);
   rememberResponseSession(responseId, sessionKey);
-  const result = await runDeepSeekCompletion({
-    model,
-    prompt: responsesToPrompt(body, tools),
-    stream: false,
-    session_id: sessionKey,
-    search_enabled: body.search_enabled,
-  });
+  const result = await (async () => {
+    let content = "";
+    for await (const event of pipeline.runChatCompletion(
+      {
+        sessionKey,
+        model,
+        prompt: responsesToPrompt(body, tools),
+        searchEnabled: Boolean(body.search_enabled),
+      },
+      { requestId: responseId, created: Math.floor(Date.now() / 1000), model },
+    )) {
+      if (event.type === "text_delta" && event.delta) content += event.delta;
+    }
+    return { content };
+  })();
 
   const toolCall = tools.length ? parseToolCallFromText(result.content, tools) : null;
   if (toolCall) {

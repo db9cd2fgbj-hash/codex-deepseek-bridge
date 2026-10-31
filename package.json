@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "login": "node src/login.mjs",
-    "start": "node src/server.mjs"
+    "prelogin": "node scripts/ensure-adb.mjs",
+    "login": "node --require ./src/android-preload.cjs src/login.mjs",
+    "start": "node --require ./src/android-preload.cjs src/server.mjs"
   },
   "dependencies": {
     "playwright-core": "^1.54.2"
